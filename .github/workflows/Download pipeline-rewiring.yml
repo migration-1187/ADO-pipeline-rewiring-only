@@ -1,0 +1,293 @@
+name: ADO Pipeline Rewiring
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pipeline-rewiring-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prerequisite-validation:
+    name: Prerequisite Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_PAT: ${{ secrets.GH_PAT }}
+      GH_TOKEN: ${{ secrets.GH_PAT }}
+      ADO_PAT: ${{ secrets.ADO_PAT }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== Checking required secrets ==="
+
+          if [ -z "${GH_PAT:-}" ]; then
+            echo "::error::Missing repository or organization secret: GH_PAT"
+            exit 1
+          fi
+
+          if [ -z "${ADO_PAT:-}" ]; then
+            echo "::error::Missing repository or organization secret: ADO_PAT"
+            exit 1
+          fi
+
+          echo "Required secrets are configured."
+
+      - name: Validate pipelines.csv
+        shell: bash
+        run: |
+          set -euo pipefail
+          PIPELINES_FILE="bash/pipelines.csv"
+
+          if [ ! -f "$PIPELINES_FILE" ]; then
+            echo "::error::Required file '$PIPELINES_FILE' was not found."
+            exit 1
+          fi
+
+          sed -i 's/\r$//' "$PIPELINES_FILE"
+          LINE_COUNT=$(wc -l < "$PIPELINES_FILE")
+          echo "Found $PIPELINES_FILE with $LINE_COUNT lines."
+
+          if [ "$LINE_COUNT" -le 1 ]; then
+            echo "::error::$PIPELINES_FILE is empty or contains only a header row."
+            exit 1
+          fi
+
+      - name: Validate migration status file
+        shell: bash
+        run: |
+          set -euo pipefail
+          STATUS_FILE="bash/repos_with_status.csv"
+
+          if [ ! -f "$STATUS_FILE" ]; then
+            echo "::warning::$STATUS_FILE is missing. All entries in pipelines.csv will be treated as successful for rewiring."
+            exit 0
+          fi
+
+          sed -i 's/\r$//' "$STATUS_FILE"
+          LINE_COUNT=$(wc -l < "$STATUS_FILE")
+          echo "Found $STATUS_FILE with $LINE_COUNT lines."
+
+          if [ "$LINE_COUNT" -le 1 ]; then
+            echo "::warning::$STATUS_FILE contains only a header. All entries in pipelines.csv will be treated as successful for rewiring."
+          fi
+
+      - name: Validate rewiring script
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f "bash/4_rewire_pipeline.sh" ]; then
+            echo "::error::Required script 'bash/4_rewire_pipeline.sh' was not found."
+            exit 1
+          fi
+
+  pipeline-rewiring:
+    name: Pipeline Rewiring
+    needs: prerequisite-validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      GH_PAT: ${{ secrets.GH_PAT }}
+      GH_TOKEN: ${{ secrets.GH_PAT }}
+      ADO_PAT: ${{ secrets.ADO_PAT }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare and filter CSV inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PIPELINES_SRC="$GITHUB_WORKSPACE/bash/pipelines.csv"
+          STATUS_SRC="$GITHUB_WORKSPACE/bash/repos_with_status.csv"
+          TARGET_PIPELINES="$GITHUB_WORKSPACE/bash/pipelines.csv"
+          TARGET_STATUS="$GITHUB_WORKSPACE/bash/repos_with_status.csv"
+
+          sed -i 's/\r$//' "$PIPELINES_SRC"
+
+          if [ -f "$STATUS_SRC" ] && [ "$(wc -l < "$STATUS_SRC")" -gt 1 ]; then
+            sed -i 's/\r$//' "$STATUS_SRC"
+            HAS_STATUS_FILE=true
+            echo "Using existing repos_with_status.csv migration results."
+          else
+            HAS_STATUS_FILE=false
+            echo "::warning::repos_with_status.csv is missing or empty. All pipeline rows will be queued."
+          fi
+
+          HEADER=$(head -n 1 "$PIPELINES_SRC" | sed 's/\r$//')
+
+          get_col_idx() {
+            echo "$HEADER" | awk -v col="$1" 'BEGIN { FS="," } {
+              for (i=1; i<=NF; i++) {
+                value=$i
+                gsub(/^"|"$/, "", value)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                if (value == col) print i
+              }
+            }'
+          }
+
+          ORG_IDX=$(get_col_idx "org")
+          PROJECT_IDX=$(get_col_idx "teamproject")
+          REPO_IDX=$(get_col_idx "repo")
+          PIPELINE_IDX=$(get_col_idx "pipeline")
+          GH_ORG_IDX=$(get_col_idx "github_org")
+          GH_REPO_IDX=$(get_col_idx "github_repo")
+          CONN_IDX=$(get_col_idx "serviceConnection")
+
+          for entry in \
+            "org:$ORG_IDX" \
+            "teamproject:$PROJECT_IDX" \
+            "repo:$REPO_IDX" \
+            "pipeline:$PIPELINE_IDX" \
+            "github_org:$GH_ORG_IDX" \
+            "github_repo:$GH_REPO_IDX" \
+            "serviceConnection:$CONN_IDX"; do
+            column=${entry%%:*}
+            index=${entry#*:}
+            if [ -z "$index" ]; then
+              echo "::error::Required column '$column' was not found in bash/pipelines.csv."
+              exit 1
+            fi
+          done
+
+          TMP_PIPELINES=$(mktemp)
+          echo "org,teamproject,repo,pipeline,github_org,github_repo,serviceConnection" > "$TMP_PIPELINES"
+
+          extract_field() {
+            local line="$1"
+            local index="$2"
+            echo "$line" | awk -v idx="$index" 'BEGIN { FS="," } { print $idx }' \
+              | sed 's/^"//;s/"$//;s/^[[:space:]]*//;s/[[:space:]]*$//'
+          }
+
+          while IFS= read -r line || [ -n "$line" ]; do
+            [ -z "$line" ] && continue
+
+            org=$(extract_field "$line" "$ORG_IDX")
+            teamproject=$(extract_field "$line" "$PROJECT_IDX")
+            repo=$(extract_field "$line" "$REPO_IDX")
+            pipeline=$(extract_field "$line" "$PIPELINE_IDX")
+            github_org=$(extract_field "$line" "$GH_ORG_IDX")
+            github_repo=$(extract_field "$line" "$GH_REPO_IDX")
+            serviceConnection=$(extract_field "$line" "$CONN_IDX")
+
+            if [ "$HAS_STATUS_FILE" = true ]; then
+              if awk -F',' -v target_repo="$repo" '
+                NR > 1 {
+                  current_repo=$3
+                  current_status=$7
+                  gsub(/^"|"$/, "", current_repo)
+                  gsub(/^"|"$/, "", current_status)
+                  gsub(/^[[:space:]]+|[[:space:]]+$/, "", current_repo)
+                  gsub(/^[[:space:]]+|[[:space:]]+$/, "", current_status)
+                  if (current_repo == target_repo && current_status == "Success") found=1
+                }
+                END { exit(found ? 0 : 1) }
+              ' "$STATUS_SRC"; then
+                echo "$org,$teamproject,$repo,$pipeline,$github_org,$github_repo,$serviceConnection" >> "$TMP_PIPELINES"
+              else
+                echo "::warning::Skipping pipeline '$pipeline' because repo '$repo' is not marked Success."
+              fi
+            else
+              echo "$org,$teamproject,$repo,$pipeline,$github_org,$github_repo,$serviceConnection" >> "$TMP_PIPELINES"
+            fi
+          done < <(tail -n +2 "$PIPELINES_SRC")
+
+          mv "$TMP_PIPELINES" "$TARGET_PIPELINES"
+
+          TMP_STATUS=$(mktemp)
+          echo "org,teamproject,repo,github_org,github_repo,visibility,status" > "$TMP_STATUS"
+
+          while IFS=',' read -r org teamproject repo pipeline github_org github_repo serviceConnection; do
+            [ "$org" = "org" ] && continue
+            echo "$org,$teamproject,$repo,$github_org,$github_repo,private,Success" >> "$TMP_STATUS"
+          done < "$TARGET_PIPELINES"
+
+          mv "$TMP_STATUS" "$TARGET_STATUS"
+
+          QUEUED_COUNT=$(( $(wc -l < "$TARGET_PIPELINES") - 1 ))
+          echo "Pipelines queued for rewiring: $QUEUED_COUNT"
+
+      - name: Verify GitHub CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh --version
+
+      - name: Authenticate GitHub CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh auth status
+
+      - name: Install gh-ado2gh extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh extension install github/gh-ado2gh >/dev/null 2>&1 || true
+
+          if ! gh extension list | grep -qi "ado2gh"; then
+            echo "::error::The gh-ado2gh extension could not be installed."
+            exit 1
+          fi
+
+          gh extension list
+
+      - name: Fix script line endings and permissions
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i 's/\r$//' bash/4_rewire_pipeline.sh
+          chmod +x bash/4_rewire_pipeline.sh
+
+      - name: Execute pipeline rewiring
+        shell: bash
+        working-directory: bash
+        run: |
+          set -euo pipefail
+          ./4_rewire_pipeline.sh
+
+      - name: Collect rewiring logs
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/rewiring-logs"
+          find "$GITHUB_WORKSPACE" -maxdepth 2 -type f \
+            \( -name 'pipeline-rewiring-*.txt' -o -name '*.log' \) \
+            -exec cp {} "$GITHUB_WORKSPACE/rewiring-logs/" \; || true
+
+      - name: Upload rewiring logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rewiring-logs
+          path: rewiring-logs/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Remove generated status file
+        if: always()
+        shell: bash
+        run: |
+          rm -f "$GITHUB_WORKSPACE/bash/repos_with_status.csv"
+
+      - name: Rewiring summary
+        if: always()
+        shell: bash
+        run: |
+          echo "========================================"
+          echo "PIPELINE REWIRING WORKFLOW COMPLETED"
+          echo "========================================"
+          echo "Check the rewiring-logs artifact for detailed results."
